@@ -8,3 +8,4 @@ build/
 *.log
 *.lib
 *.a
+settings.xml

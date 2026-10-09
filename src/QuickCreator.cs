@@ -39,8 +39,7 @@ public static class QuickCreator {
         var plan=new CreationPlan{Root=root,Target=target,Existing=old,AllowMissingExecutable=allowMissingExecutable};if(old!=null){var info=new FileInfo(old);plan.ExistingLength=info.Length;plan.ExistingWrite=info.LastWriteTimeUtc;}return plan;
     }
     public static CreationResult Create(CreationPlan plan,IList<MixEntry> selected,bool keepExisting,bool install,string editor,string kind,bool allowUnrecognizedEditor=false){
-        if(selected.Count==0)throw new IOException("请先导入至少一个 MP4 视频。");
-        if(install){if(allowUnrecognizedEditor){if(String.IsNullOrWhiteSpace(editor)||!Directory.Exists(editor))throw new IOException("请先选择存在的编辑器目录。");}else EditorRoot(editor);}
+        CheckInputs(selected,install,editor,allowUnrecognizedEditor);
         string lockName;using(var sha=SHA256.Create())lockName="Local\\War3VideoPackageWriter_"+BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(plan.Root.ToUpperInvariant()))).Replace("-","");
         using(var gate=new Mutex(false,lockName)){
             bool locked;try{locked=gate.WaitOne(0);}catch(AbandonedMutexException){locked=true;}if(!locked)throw new IOException("另一个工具正在操作这个魔兽目录，请稍后重试。");
@@ -59,6 +58,16 @@ public static class QuickCreator {
         var result=new CreationResult{Path=plan.Target};
         if(install){try{GuiInstaller.Install(editor,kind);result.EditorInstalled=true;}catch(Exception e){result.EditorError=e.Message;}}
         return result;
+    }
+    public static void CheckInputs(IList<MixEntry> selected,bool install,string editor,bool allowUnrecognizedEditor){
+        if(selected==null||selected.Count==0)throw new IOException("请先导入至少一个 MP4 视频，再点击“生成视频包”。");
+        foreach(var entry in selected){
+            if(entry==null||!MixPackage.ValidName(entry.Name)||entry.Length<=0)throw new IOException("视频列表包含无效或空的视频，请移除后重新导入。");
+            if(!File.Exists(entry.Source))throw new IOException("视频来源已不存在，请重新导入："+entry.Name);
+            long size=new FileInfo(entry.Source).Length;
+            if(entry.Offset<0||entry.Offset>size||entry.Length>size-entry.Offset)throw new IOException("视频来源已变化或不完整，请重新导入："+entry.Name);
+        }
+        if(install){if(allowUnrecognizedEditor){if(String.IsNullOrWhiteSpace(editor)||!Directory.Exists(editor))throw new IOException("请先选择存在的编辑器目录，或取消勾选安装触发器动作。");}else EditorRoot(editor);}
     }
     static void Validate(CreationPlan plan){
         var fresh=Plan(plan.Root,System.IO.Path.GetFileName(plan.Target),plan.AllowMissingExecutable);
