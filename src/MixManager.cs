@@ -111,35 +111,43 @@ class MixManager : Form {
         finally{busy=false;creationControlsEnabled(true);workflows.Enabled=true;buttons.Enabled=true;editorBar.Enabled=true;list.Enabled=true;}
     }
     Button AddButton(string text,EventHandler handler){var b=new Button{Text=text,AutoSize=true,Height=28};b.Click+=handler;buttons.Controls.Add(b);return b;}
-    void RefreshList(){list.Items.Clear();foreach(var e in entries){var item=new ListViewItem(e.Name);item.SubItems.Add((e.Length/1048576.0).ToString("0.00")+" MB");item.Tag=e;list.Items.Add(item);}Text="War3 MIX 视频管理器 v"+AppVersion.Number+(current==null?" — 新包":" — "+Path.GetFileName(current))+(dirty?" *":"");info.Text="内置DLL和播放器 · "+entries.Count+" 段视频 · "+(entries.Sum(e=>e.Length)/1048576.0).ToString("0.00")+" MB · 只分发一个 MIX";if(updateWorkflow!=null)updateWorkflow();}
+    void RefreshList(){list.BeginUpdate();try{list.Items.Clear();foreach(var e in entries){var item=new ListViewItem(e.Name);item.SubItems.Add((e.Length/1048576.0).ToString("0.00")+" MB");item.Tag=e;list.Items.Add(item);}}finally{list.EndUpdate();}Text="War3 MIX 视频管理器 v"+AppVersion.Number+(current==null?" — 新包":" — "+Path.GetFileName(current))+(dirty?" *":"");info.Text="内置DLL和播放器 · "+entries.Count+" 段视频 · "+(entries.Sum(e=>e.Length)/1048576.0).ToString("0.00")+" MB · 只分发一个 MIX";if(updateWorkflow!=null)updateWorkflow();}
     bool Discard(){return !dirty || MessageBox.Show(this,"放弃尚未保存的修改？","未保存修改",MessageBoxButtons.YesNo,MessageBoxIcon.Question)==DialogResult.Yes;}
     void OpenPackage(string path){if(!Discard())return;try{var package=MixPackage.Open(path);entries=package.Entries;current=package.PathName;dirty=false;mixName.Text=Path.GetFileName(current);string folder=Path.GetDirectoryName(current);if(File.Exists(Path.Combine(folder,"war3.exe")))gamePath.Text=folder;workflows.SelectedIndex=1;RefreshList();SavePreferences();}catch(Exception e){MessageBox.Show(this,e.Message,"打开失败");}}
     void Import(string[] files) {
         foreach(string file in files){string name=Path.GetFileName(file);if(!MixPackage.ValidName(name)){MessageBox.Show(this,"仅支持MP4，文件名不超过120字符："+name);continue;}
             var existing=entries.Find(e=>e.Name.Equals(name,StringComparison.OrdinalIgnoreCase));
             if(existing!=null && MessageBox.Show(this,"替换包中的 "+name+"？","同名视频",MessageBoxButtons.YesNo)==DialogResult.No)continue;
-            long size=new FileInfo(file).Length;if(size==0){MessageBox.Show(this,"文件为空："+name);continue;}
+            long size;try{size=new FileInfo(file).Length;}catch(Exception e){MessageBox.Show(this,"无法导入 "+name+"："+e.Message);continue;}if(size==0){MessageBox.Show(this,"文件为空："+name);continue;}
             if(existing!=null)entries.Remove(existing);entries.Add(new MixEntry(name,Path.GetFullPath(file),0,size));dirty=true;
         }RefreshList();
     }
     void ChooseVideos(){using(var dialog=new OpenFileDialog{Filter="MP4视频|*.mp4",Multiselect=true})if(dialog.ShowDialog(this)==DialogResult.OK)Import(dialog.FileNames);}
-    void RemoveSelected(){foreach(ListViewItem item in list.SelectedItems)entries.Remove((MixEntry)item.Tag);dirty=true;RefreshList();}
+    void RemoveSelected(){if(list.SelectedItems.Count==0)return;foreach(ListViewItem item in list.SelectedItems)entries.Remove((MixEntry)item.Tag);dirty=true;RefreshList();}
     async Task<bool> Work(Action action,string text) {
         if(busy)return false;busy=true;creationControlsEnabled(false);workflows.Enabled=false;buttons.Enabled=false;editorBar.Enabled=false;list.Enabled=false;info.Text=text;
         try{await Task.Run(action);return true;}catch(Exception e){MessageBox.Show(this,e.Message+"\n若游戏正在使用此MIX，请先退出游戏。","操作失败");return false;}
         finally{busy=false;creationControlsEnabled(true);workflows.Enabled=true;buttons.Enabled=true;editorBar.Enabled=true;list.Enabled=true;RefreshList();}
     }
     async void SavePackage(bool saveAs) {
+        if(busy)return;
         try{QuickCreator.CheckInputs(entries,false,"",false);}catch(Exception e){MessageBox.Show(this,e.Message,"还需要一步");return;}
         string dest=current;
         if(saveAs||dest==null){using(var dialog=new SaveFileDialog{Filter="War3 视频包|*.mix",FileName=current==null?"War3Video.mix":Path.GetFileName(current)}){if(dialog.ShowDialog(this)!=DialogResult.OK)return;dest=dialog.FileName;}}
-        string target=dest;var snapshot=entries.ToList();
+        string target=dest;var snapshot=entries.ToList();MixPackage savedPackage=null;CreationPlan plan=null;
+        string folder=Path.GetDirectoryName(Path.GetFullPath(target));
+        if(saveAs && (File.Exists(Path.Combine(folder,"war3.exe"))||String.Equals(folder,gamePath.Text,StringComparison.OrdinalIgnoreCase))){
+            try{plan=QuickCreator.Plan(folder,Path.GetFileName(target),true);}
+            catch(Exception e){MessageBox.Show(this,e.Message,"无法另存视频包");return;}
+            if(plan.Existing!=null && !String.Equals(plan.Existing,plan.Target,StringComparison.OrdinalIgnoreCase) && MessageBox.Show(this,"魔兽根目录只能启用一个视频包。\r\n将保存为 "+Path.GetFileName(target)+"，原包 "+Path.GetFileName(plan.Existing)+" 会备份并停用。\r\n继续？","另存视频包",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
+        }
         bool saved=await Work(delegate {
             var assembly=Assembly.GetExecutingAssembly();
-            using(var dll=assembly.GetManifestResourceStream("bootstrap"))using(var player=assembly.GetManifestResourceStream("player"))MixPackage.Build(target,dll,player,snapshot);
-            var package=MixPackage.Open(target);entries=package.Entries;current=package.PathName;dirty=false;
+            if(plan!=null)QuickCreator.Create(plan,snapshot,false,false,"","KKWE");
+            else using(var dll=assembly.GetManifestResourceStream("bootstrap"))using(var player=assembly.GetManifestResourceStream("player"))MixPackage.Build(target,dll,player,snapshot);
+            savedPackage=MixPackage.Open(target);
         },"正在封装视频，请稍候…");
-        if(saved){SavePreferences();info.Text="已保存视频包："+current;}
+        if(saved){entries=savedPackage.Entries;current=savedPackage.PathName;dirty=false;mixName.Text=Path.GetFileName(current);RefreshList();SavePreferences();info.Text="已保存视频包："+current;}
     }
     async void ExportSelected() {
         var chosen=list.SelectedItems.Cast<ListViewItem>().Select(i=>(MixEntry)i.Tag).ToList();if(chosen.Count==0){MessageBox.Show(this,"先选择需要导出的视频，可多选。");return;}

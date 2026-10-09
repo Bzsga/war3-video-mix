@@ -10,6 +10,8 @@ using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
+using System.Threading;
+using System.Threading.Tasks;
 
 // Optional out-of-process video extension. No game DLL patches or custom natives.
 class VideoCompanion {
@@ -31,17 +33,27 @@ class VideoCompanion {
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h,int i,int v);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int height,uint flags);
     [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr h,uint color,byte alpha,uint flags);
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
     static string root, request, log, evidence;
     static Window win;
     static MediaElement media;
     static IntPtr target, overlay;
     static Process attachedGame;
+    static bool attachedProcessReadable=true;
+    static IntPtr ownerHandle;
+    static DateTime ownerCheckAfter=DateTime.MinValue;
+    static CancellationTokenSource extraction;
+    static readonly object logGate=new object();
     static int attachedPid, pinnedPid, clientPid;
     static string active="", lastText="";
     static double offset, duration;
     static double volume=1, rate=1;
     static DateTime received, opened, deadline;
     static bool ready, visible, preview, automatic;
+    static bool positioned;
+    static int positionedX,positionedY,positionedWidth,positionedHeight;
     static HashSet<string> completed=new HashSet<string>();
     static Dictionary<string,string> clips=new Dictionary<string,string>();
     static int opens, frameChecks;
@@ -55,12 +67,23 @@ class VideoCompanion {
     static double lastElapsed;
     static DateTime lastProtocol=DateTime.MinValue;
     static DateTime lastFileWrite=DateTime.MinValue;
+    static long lastFileLength=-1;
+    static DateTime requestReadAfter=DateTime.MinValue;
+    static readonly Regex protocol=new Regex(@"WV1\|([A-Za-z0-9_-]{1,64})\|(\d{1,9})\|(PLAY|STOP|SETTINGS)\|([^|\r\n]{1,120})\|([0-9]{1,6}(?:\.[0-9]{1,5})?)\|([0-9]{1,6}(?:\.[0-9]{1,5})?)(?:\|([0-9]{1,3}(?:\.[0-9]{1,5})?)\|([0-9]{1,2}(?:\.[0-9]{1,5})?))?\|END");
     static DateTime gameStarted=DateTime.MinValue;
-    static void Log(string s) { Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(log)));File.AppendAllText(log,DateTime.UtcNow.ToString("o")+" "+s+Environment.NewLine); }
+    static void Log(string s) { lock(logGate){try{Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(log)));File.AppendAllText(log,DateTime.UtcNow.ToString("o")+" "+s+Environment.NewLine);}catch(IOException){}catch(UnauthorizedAccessException){}} }
     static string Arg(string[] args,string k,string fallback) {
         for(int i=0;i<args.Length-1;i++) if(args[i]==k) return args[i+1]; return fallback;
     }
     static double Num(string s) { return double.Parse(s,CultureInfo.InvariantCulture); }
+    static bool OwnerExited(){
+        if(ownerPid<=0)return false;
+        if(ownerHandle!=IntPtr.Zero)return WaitForSingleObject(ownerHandle,0)==0;
+        // Some loaders restrict process handles. PID existence needs no open
+        // process handle; the attached HWND still stops audio within one tick.
+        if(DateTime.UtcNow<ownerCheckAfter && (target!=IntPtr.Zero||pinnedPid<=0))return false;ownerCheckAfter=DateTime.UtcNow.AddSeconds(1);
+        try{using(var owner=Process.GetProcessById(ownerPid)){}return false;}catch(ArgumentException){return true;}
+    }
     static void FindGame() {
         if(gameRoot==null || (target!=IntPtr.Zero && IsWindow(target)) || DateTime.UtcNow<scanAfter)return;
         scanAfter=DateTime.UtcNow.AddSeconds(1);
@@ -78,10 +101,10 @@ class VideoCompanion {
                 string path=null;try{path=p.MainModule.FileName;}catch(System.ComponentModel.Win32Exception){}
                 if(path!=null && !Path.GetDirectoryName(path).Equals(gameRoot,StringComparison.OrdinalIgnoreCase))return true;
                 if(active!="")Stop("game-changed");
-                completed.Clear();lastText="";lastSequence=-1;lastSession="";
+                completed.Clear();lastText="";lastSequence=-1;lastSession="";lastFileWrite=DateTime.MinValue;lastFileLength=-1;requestReadAfter=DateTime.MinValue;
                 try{gameStarted=p.StartTime.ToUniversalTime();}catch{gameStarted=DateTime.UtcNow.AddSeconds(-5);}
                 if(attachedGame!=null)attachedGame.Dispose();
-                attachedGame=Process.GetProcessById((int)id);attachedPid=(int)id;
+                attachedGame=Process.GetProcessById((int)id);attachedPid=(int)id;attachedProcessReadable=true;
                 target=h;Log("ATTACHED pid="+id+" handle="+target+" path="+(path??"unavailable"));return false;
             }}catch(Exception){return true;}
         },IntPtr.Zero);
@@ -110,27 +133,41 @@ class VideoCompanion {
     }
     static void Stop(string reason) {
         if(active!="") { Log("STOP "+active+" "+reason); completed.Add(active); }
-        media.Stop(); media.Close(); win.Hide(); active="";ready=false;visible=false;
+        if(extraction!=null){extraction.Cancel();extraction=null;}
+        win.Hide();active="";ready=false;visible=false;positioned=false;
+        // Close already stops and releases the graph. Do not stop it twice.
+        if(media.Source!=null){media.Volume=0;media.Close();}
     }
-    static bool ValidClip(string id,out string path) {
+    static bool ValidClip(string id,out string path,CancellationToken cancel) {
         path=null;
         if(id.Length==0 || id.Length>120 || id.IndexOfAny(Path.GetInvalidFileNameChars())>=0 || Path.GetFileName(id)!=id)return false;
         string name;
         if(!clips.TryGetValue(id,out name))name=id.EndsWith(".mp4",StringComparison.OrdinalIgnoreCase)?id:id+".mp4";
         if(bundle!=null) {
-            try {path=bundle.Resolve(name,bundleCache);if(path!=null)Log("PACKAGE clip="+name+" cache="+path);return path!=null;}
+            try {path=bundle.Resolve(name,bundleCache,cancel);if(path!=null)Log("PACKAGE clip="+name+" cache="+path);return path!=null;}
+            catch(OperationCanceledException){throw;}
             catch(Exception e){Log("FALLBACK package "+e.Message);return false;}
         }
         path=Path.GetFullPath(Path.Combine(root,"clips",name));
         return path.StartsWith(Path.GetFullPath(Path.Combine(root,"clips"))+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase) && File.Exists(path);
     }
-    static void Play(string key,string clip,double elapsed,double seconds) {
-        string path;
+    static async void Play(string key,string clip,double elapsed,double seconds) {
         if(completed.Contains(key)) return;
-        if(!ValidClip(clip,out path)) { completed.Add(key);Log("FALLBACK missing clip "+clip+"; expected clips/"+clip+".mp4");return; }
         if(active!="") Stop("replaced");
         active=key;automatic=seconds==0;offset=automatic?0:elapsed;duration=seconds;received=DateTime.UtcNow;deadline=received.AddSeconds(automatic?15:Math.Max(0,seconds-elapsed)+2);
-        ready=false;media.Volume=volume;media.SpeedRatio=rate;media.Source=new Uri(path);media.Play();opens++;Log("PLAY "+key+" "+clip+" offset="+offset+" auto="+automatic);
+        var loading=new CancellationTokenSource();extraction=loading;
+        try{
+            // First use can copy gigabytes. Keep the dispatcher available for
+            // target exit, stop and settings, and cancel copying between chunks.
+            string path=await Task.Run(()=>{string found;return ValidClip(clip,out found,loading.Token)?found:null;});
+            if(loading.IsCancellationRequested||extraction!=loading||active!=key)return;
+            extraction=null;
+            if(path==null){Log("FALLBACK missing clip "+clip);Stop("missing-clip");return;}
+            deadline=DateTime.UtcNow.AddSeconds(automatic?15:Math.Max(0,seconds-offset)+2);
+            ready=false;media.Volume=volume;media.SpeedRatio=rate;media.Source=new Uri(path);media.Play();opens++;Log("PLAY "+key+" "+clip+" offset="+offset+" auto="+automatic);
+        }catch(OperationCanceledException){}
+        catch(Exception e){if(extraction==loading){Log("FALLBACK load "+e.Message);Stop("load-failed");}}
+        finally{loading.Dispose();}
     }
     static void PollRequest() {
         if(!File.Exists(request)) {
@@ -138,21 +175,26 @@ class VideoCompanion {
             using(var marker=new FileStream(request,FileMode.OpenOrCreate,FileAccess.Write,FileShare.ReadWrite|FileShare.Delete)){}
             return;
         }
+        var fileInfo=new FileInfo(request);DateTime fileWrite=fileInfo.LastWriteTimeUtc;long length=fileInfo.Length;
+        if(length==0||length>8192)return;
+        // A periodic content check also handles files rewritten with preserved
+        // metadata. Invalid/partial requests never advance the read signature.
+        if(fileWrite==lastFileWrite && length==lastFileLength && DateTime.UtcNow<requestReadAfter)return;
         string text;
         using(var f=new FileStream(request,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)) {
             if(f.Length>8192) return;
             using(var r=new StreamReader(f)) text=r.ReadToEnd();
         }
-        DateTime fileWrite=File.GetLastWriteTimeUtc(request);
+        requestReadAfter=DateTime.UtcNow.AddSeconds(1);
         if(text==lastText && fileWrite==lastFileWrite) return;
-        var m=Regex.Match(text,@"WV1\|([A-Za-z0-9_-]{1,64})\|(\d{1,9})\|(PLAY|STOP|SETTINGS)\|([^|\r\n]{1,120})\|([0-9]{1,6}(?:\.[0-9]{1,5})?)\|([0-9]{1,6}(?:\.[0-9]{1,5})?)(?:\|([0-9]{1,3}(?:\.[0-9]{1,5})?)\|([0-9]{1,2}(?:\.[0-9]{1,5})?))?\|END");
+        var m=protocol.Match(text);
         if(!m.Success) return;
         // Accept one-shot requests made during this game even if cold extraction
         // delayed attachment. Reject markers left by an earlier game instead.
-        if(gameStarted!=DateTime.MinValue && fileWrite<gameStarted) {lastText=text;lastFileWrite=fileWrite;return;}
+        if(gameStarted!=DateTime.MinValue && fileWrite<gameStarted) {lastText=text;lastFileWrite=fileWrite;lastFileLength=length;return;}
         double seconds=Num(m.Groups[5].Value), elapsed=Num(m.Groups[6].Value);
         if(seconds<0 || seconds>600 || elapsed<0 || (seconds>0 && elapsed>seconds)) return;
-        lastText=text;lastFileWrite=fileWrite;
+        lastText=text;lastFileWrite=fileWrite;lastFileLength=length;
         if(m.Groups[7].Success) {
             double nextVolume=Num(m.Groups[7].Value)/100, nextRate=Num(m.Groups[8].Value);
             if(nextVolume<0 || nextVolume>1 || nextRate<0.25 || nextRate>4)return;
@@ -180,7 +222,7 @@ class VideoCompanion {
     static void Position() {
         if(preview) return;
         if(target==IntPtr.Zero || !IsWindow(target) || IsIconic(target) || !IsWindowVisible(target)) {
-            if(visible) {win.Hide();visible=false;Log("HIDDEN focus/minimized");}return;
+            if(visible) {win.Hide();visible=false;positioned=false;Log("HIDDEN focus/minimized");}return;
         }
         RECT r;POINT p=new POINT();if(!GetClientRect(target,out r) || !ClientToScreen(target,ref p)) return;
         if(!visible && ready) {win.Show();visible=true;Log("VISIBLE");}
@@ -191,15 +233,22 @@ class VideoCompanion {
             // Keep this overlay immediately above its game in the normal Z order,
             // allowing both visible clients to render without covering other apps.
             IntPtr above=GetWindow(target,3);
-            SetWindowPos(overlay,above==overlay?IntPtr.Zero:above,p.X,p.Y,r.R-r.L,r.B-r.T,(uint)(0x0010|(above==overlay?0x0004:0)));
+            int width=r.R-r.L,height=r.B-r.T;
+            if(!positioned||positionedX!=p.X||positionedY!=p.Y||positionedWidth!=width||positionedHeight!=height||above!=overlay){
+                // No activation/owner reorder or synchronous position callback.
+                // ASYNCWINDOWPOS avoids waiting if Windows crosses input queues.
+                if(SetWindowPos(overlay,above==overlay?IntPtr.Zero:above,p.X,p.Y,width,height,(uint)(0x0010|0x0200|0x0400|0x4000|(above==overlay?0x0004:0)))){
+                    positioned=true;positionedX=p.X;positionedY=p.Y;positionedWidth=width;positionedHeight=height;
+                }
+            }
         }
     }
     static void CheckGameLifetime() {
         if(target==IntPtr.Zero)return;
         uint windowPid;GetWindowThreadProcessId(target,out windowPid);
         bool gone=!IsWindow(target)||(attachedPid>0 && windowPid!=(uint)attachedPid);
-        if(!gone && attachedGame!=null) {
-            try{gone=attachedGame.HasExited;}catch(System.ComponentModel.Win32Exception){}
+        if(!gone && attachedGame!=null && attachedProcessReadable) {
+            try{gone=attachedGame.HasExited;}catch(System.ComponentModel.Win32Exception){attachedProcessReadable=false;}
         }
         if(!gone)return;
         Stop("attached-game-exit");target=IntPtr.Zero;attachedPid=0;gameStarted=DateTime.MinValue;
@@ -240,6 +289,9 @@ class VideoCompanion {
             string[] p=l.Split('=');if(p.Length==2)clips[p[0].Trim()]=p[1].Trim();
         }
         var app=new Application();app.ShutdownMode=ShutdownMode.OnExplicitShutdown;
+        // EnableRaisingEvents opens PROCESS_ALL_ACCESS on .NET Framework,
+        // which protected War3 loaders may deny. Waiting needs only SYNCHRONIZE.
+        if(ownerPid>0){ownerHandle=OpenProcess(0x00100000,false,ownerPid);if(OwnerExited()){if(ownerHandle!=IntPtr.Zero)CloseHandle(ownerHandle);return 0;}}
         if(!preview){bool created;instance=new System.Threading.Mutex(true,@"Local\War3VideoCompanion"+(clientPid>0?"_"+clientPid:""),out created);if(!created){if(ownerPid==0)MessageBox.Show("视频增强已在后台运行。");instance.Dispose();return 0;}}
         gameRoot=Arg(args,"--game-root",null);
         if(!preview && pid==0 && gameRoot==null && !Setup())return 0;
@@ -273,10 +325,11 @@ class VideoCompanion {
         var tick=new DispatcherTimer {Interval=TimeSpan.FromMilliseconds(100)};
         tick.Tick+=delegate {
             try {
-                if(ownerPid>0) {try {using(var owner=Process.GetProcessById(ownerPid)) {}}catch(ArgumentException){Stop("game-exit");app.Shutdown();return;}}
+                if(OwnerExited()){Stop("game-exit");app.Shutdown();return;}
                 if(File.Exists(log+".stop")){Stop("shutdown");app.Shutdown();return;}
                 if(!preview) {CheckGameLifetime();FindGame();if(target!=IntPtr.Zero && IsWindow(target))PollRequest();}
                 if(active!="") {
+                    if(extraction!=null)return; // Extraction is cancellable, not decode time.
                     if(DateTime.UtcNow>deadline) Stop("deadline");
                     else if(!preview && !automatic && (DateTime.UtcNow-received).TotalSeconds>2) Stop("heartbeat-timeout");
                     // Maps own keyboard actions and targeted stops. A global
@@ -288,9 +341,10 @@ class VideoCompanion {
         var capture=new DispatcherTimer {Interval=TimeSpan.FromSeconds(1)};
         capture.Tick+=delegate {try {CaptureFrame();} catch(Exception e){Log("CAPTURE_ERROR "+e.Message);} };
         Log("START pid="+pid+" preview="+preview+" request="+request);
+        if(ownerPid>0)Log("OWNER_MONITOR "+(ownerHandle!=IntPtr.Zero?"synchronize-handle":"pid-fallback"));
         if(bundle!=null)Log("BUNDLE "+bundle.PathName+" entries="+bundle.Entries.Count);
         tick.Start();if(evidence!=null)capture.Start();
         if(preview) Play("preview:1",Arg(args,"--clip","demo"),0,Num(Arg(args,"--duration","8")));
-        app.Run();if(attachedGame!=null)attachedGame.Dispose();if(instance!=null){instance.ReleaseMutex();instance.Dispose();}Log("EXIT opens="+opens);return 0;
+        app.Run();if(extraction!=null)extraction.Cancel();if(ownerHandle!=IntPtr.Zero)CloseHandle(ownerHandle);if(attachedGame!=null)attachedGame.Dispose();if(instance!=null){instance.ReleaseMutex();instance.Dispose();}Log("EXIT opens="+opens);return 0;
     }
 }

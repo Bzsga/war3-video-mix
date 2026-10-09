@@ -106,7 +106,11 @@ BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID reserved) {
         HANDLE thread;
         if(!GameProcess())return TRUE;
         DisableThreadLibraryCalls(module);
-        if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,(LPCWSTR)&DllMain,&retained)) {
+        // Import slots in other modules point at our routing functions. Miles
+        // can release its provider before those modules finish shutting down.
+        // Keep the code mapped until process termination; do not unhook under
+        // the loader lock while another thread might be inside the hook.
+        if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,(LPCWSTR)&DllMain,&retained)) {
             thread=CreateThread(NULL,0,Start,NULL,0,NULL);
             if(thread)CloseHandle(thread);else FreeLibrary(retained);
         }

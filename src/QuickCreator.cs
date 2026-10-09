@@ -3,9 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Collections.Generic;
-using System.Security.Cryptography;
 using System.Text;
-using System.Threading;
 
 public class CreationPlan {
     public string Root,Target,Existing;
@@ -40,9 +38,7 @@ public static class QuickCreator {
     }
     public static CreationResult Create(CreationPlan plan,IList<MixEntry> selected,bool keepExisting,bool install,string editor,string kind,bool allowUnrecognizedEditor=false){
         CheckInputs(selected,install,editor,allowUnrecognizedEditor);
-        string lockName;using(var sha=SHA256.Create())lockName="Local\\War3VideoPackageWriter_"+BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(plan.Root.ToUpperInvariant()))).Replace("-","");
-        using(var gate=new Mutex(false,lockName)){
-            bool locked;try{locked=gate.WaitOne(0);}catch(AbandonedMutexException){locked=true;}if(!locked)throw new IOException("另一个工具正在操作这个魔兽目录，请稍后重试。");
+        using(MixPackage.AcquireWriter(plan.Root)){
             string stage=plan.Target+"."+Guid.NewGuid().ToString("N")+".pending",backup=null;bool moved=false;
             try{
                 Validate(plan);
@@ -53,7 +49,7 @@ public static class QuickCreator {
                 if(plan.Existing!=null){backup=plan.Existing+".bak";if(File.Exists(backup))backup=plan.Existing+"."+Guid.NewGuid().ToString("N")+".bak";}
                 if(String.Equals(plan.Existing,plan.Target,StringComparison.OrdinalIgnoreCase))File.Replace(stage,plan.Target,backup);
                 else{if(plan.Existing!=null){File.Move(plan.Existing,backup);moved=true;}try{File.Move(stage,plan.Target);}catch{if(moved){File.Move(backup,plan.Existing);moved=false;}throw;}}
-            }finally{if(File.Exists(stage))File.Delete(stage);gate.ReleaseMutex();}
+            }finally{if(File.Exists(stage))File.Delete(stage);}
         }
         var result=new CreationResult{Path=plan.Target};
         if(install){try{GuiInstaller.Install(editor,kind);result.EditorInstalled=true;}catch(Exception e){result.EditorError=e.Message;}}

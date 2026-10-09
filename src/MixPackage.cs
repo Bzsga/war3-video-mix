@@ -2,10 +2,13 @@ using System;
 using System.IO;
 using System.Text;
 using System.Collections.Generic;
+using System.Threading;
+using System.Security.Cryptography;
 
 public class MixEntry {
     public string Name, Source;
     public long Offset, Length;
+    public string SourcePackageId;
     public MixEntry(string name,string source,long offset,long length){Name=name;Source=source;Offset=offset;Length=length;}
 }
 public class MixPackage {
@@ -35,49 +38,83 @@ public class MixPackage {
                 string name=new UTF8Encoding(false,true).GetString(reader.ReadBytes(n));
                 long offset=reader.ReadInt64(),length=reader.ReadInt64();
                 if(!ValidName(name)||!names.Add(name)||offset<previous)throw new InvalidDataException("视频文件名或布局无效。");
-                Range(offset,length,index);previous=offset+length;result.Entries.Add(new MixEntry(name,path,offset,length));
+                Range(offset,length,index);previous=offset+length;result.Entries.Add(new MixEntry(name,path,offset,length){SourcePackageId=result.Id});
                 if(file.Position>index+size)throw new InvalidDataException("索引越界。");
             }
             if(file.Position!=footer)throw new InvalidDataException("索引长度无效。");
             return result;
         }
     }
-    public static void Copy(Stream source,Stream output,long length) {
+    public static void Copy(Stream source,Stream output,long length,CancellationToken cancel=default(CancellationToken)) {
         byte[] buffer=new byte[1024*1024];
-        while(length>0){int n=source.Read(buffer,0,(int)Math.Min(buffer.Length,length));if(n<=0)throw new EndOfStreamException("视频数据不完整。");output.Write(buffer,0,n);length-=n;}
+        while(length>0){cancel.ThrowIfCancellationRequested();int n=source.Read(buffer,0,(int)Math.Min(buffer.Length,length));if(n<=0)throw new EndOfStreamException("视频数据不完整。");output.Write(buffer,0,n);length-=n;}
     }
-    public static void Export(MixEntry entry,string destination) {
+    public static void Export(MixEntry entry,string destination,CancellationToken cancel=default(CancellationToken)) {
         string temp=destination+"."+Guid.NewGuid().ToString("N")+".tmp";
         try {
-            using(var input=new FileStream(entry.Source,FileMode.Open,FileAccess.Read,FileShare.Read))using(var output=File.Create(temp)){input.Position=entry.Offset;Copy(input,output,entry.Length);}
+            using(var input=new FileStream(entry.Source,FileMode.Open,FileAccess.Read,FileShare.Read))using(var output=File.Create(temp)){CheckSource(entry);input.Position=entry.Offset;Copy(input,output,entry.Length,cancel);}
+            cancel.ThrowIfCancellationRequested();
             if(File.Exists(destination))File.Replace(temp,destination,null);else File.Move(temp,destination);
         }finally{if(File.Exists(temp))File.Delete(temp);}
     }
-    public string Resolve(string name,string cache) {
+    public string Resolve(string name,string cache,CancellationToken cancel=default(CancellationToken)) {
+        cancel.ThrowIfCancellationRequested();
         if(!name.EndsWith(".mp4",StringComparison.OrdinalIgnoreCase))name+=".mp4";
         if(!ValidName(name))return null;
         MixEntry entry=Entries.Find(e=>e.Name.Equals(name,StringComparison.OrdinalIgnoreCase));if(entry==null)return null;
         string folder=Path.Combine(cache,Id,"clips");Directory.CreateDirectory(folder);
         string path=Path.Combine(folder,entry.Name);
         if(!File.Exists(path)||new FileInfo(path).Length!=entry.Length) {
-            try{Export(entry,path);}
+            try{Export(entry,path,cancel);}
             catch(IOException){if(!File.Exists(path)||new FileInfo(path).Length!=entry.Length)throw;}
             // A second client may have atomically completed the same cache file.
         }
         return path;
     }
+    static void CheckSource(MixEntry entry) {
+        if(entry.SourcePackageId!=null && Open(entry.Source).Id!=entry.SourcePackageId)
+            throw new IOException("来源视频包已被更新，请重新打开后再操作："+System.IO.Path.GetFileName(entry.Source));
+    }
+    sealed class WriterGate : IDisposable {
+        Mutex mutex;
+        public WriterGate(string root) {
+            string name;using(var sha=SHA256.Create())name="Local\\War3VideoPackageWriter_"+BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(System.IO.Path.GetFullPath(root).TrimEnd(System.IO.Path.DirectorySeparatorChar).ToUpperInvariant()))).Replace("-","");
+            mutex=new Mutex(false,name);bool locked;
+            try{locked=mutex.WaitOne(0);}catch(AbandonedMutexException){locked=true;}
+            if(!locked){mutex.Dispose();throw new IOException("另一个工具正在操作这个目录，请稍后重试。");}
+        }
+        public void Dispose(){mutex.ReleaseMutex();mutex.Dispose();}
+    }
+    public static IDisposable AcquireWriter(string root){return new WriterGate(root);}
     public static void Build(string destination,Stream bootstrap,Stream player,IList<MixEntry> entries) {
         if(entries.Count>4096)throw new InvalidDataException("最多4096段视频。");
         var names=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach(var e in entries){if(!ValidName(e.Name)||!names.Add(e.Name)||e.Length<=0)throw new InvalidDataException("视频名重复或文件无效。");}
         destination=Path.GetFullPath(destination);string temp=destination+"."+Guid.NewGuid().ToString("N")+".tmp";
+        using(AcquireWriter(System.IO.Path.GetDirectoryName(destination))) {
+        // Hold all sources through commit: other writers cannot change a clip
+        // midway through copying. Dispose before replacing a source package.
+        var sources=new Dictionary<string,FileStream>(StringComparer.OrdinalIgnoreCase);
+        var sourceIds=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
         try {
+            if(File.Exists(destination)&&destination.EndsWith(".mix",StringComparison.OrdinalIgnoreCase)){
+                try{Open(destination);}catch(InvalidDataException){throw new IOException("目标不是视频包，不能覆盖其他 MIX 插件。请换一个名称。");}
+            }
+            foreach(var entry in entries){
+                string source=Path.GetFullPath(entry.Source);
+                if(!sources.ContainsKey(source))sources.Add(source,new FileStream(source,FileMode.Open,FileAccess.Read,FileShare.Read));
+                if(entry.SourcePackageId!=null){
+                    if(!sourceIds.ContainsKey(source))sourceIds.Add(source,Open(source).Id);
+                    if(sourceIds[source]!=entry.SourcePackageId)throw new IOException("来源视频包已被更新，请重新打开后再保存："+System.IO.Path.GetFileName(source));
+                }
+                Range(entry.Offset,entry.Length,sources[source].Length);
+            }
             using(var file=File.Create(temp))using(var writer=new BinaryWriter(file,Encoding.UTF8)) {
                 Copy(bootstrap,file,bootstrap.Length);long exeOffset=file.Position;Copy(player,file,player.Length);long exeLength=file.Position-exeOffset;
                 var packed=new List<MixEntry>();
                 foreach(var entry in entries) {
                     long offset=file.Position;
-                    using(var input=new FileStream(entry.Source,FileMode.Open,FileAccess.Read,FileShare.Read)){input.Position=entry.Offset;Copy(input,file,entry.Length);}
+                    var input=sources[Path.GetFullPath(entry.Source)];input.Position=entry.Offset;Copy(input,file,entry.Length);
                     packed.Add(new MixEntry(entry.Name,destination,offset,entry.Length));
                 }
                 long index=file.Position;writer.Write(packed.Count);
@@ -86,7 +123,9 @@ public class MixPackage {
                 writer.Write(Magic);writer.Write(exeOffset);writer.Write(exeLength);writer.Write(index);writer.Write(size);writer.Write(Guid.NewGuid().ToByteArray());writer.Flush();file.Flush(true);
             }
             Open(temp); // Reject malformed output before replacing the working package.
+            foreach(var input in sources.Values)input.Dispose();sources.Clear();
             if(File.Exists(destination))File.Replace(temp,destination,destination+".bak");else File.Move(temp,destination);
-        }finally{if(File.Exists(temp))File.Delete(temp);}
+        }finally{foreach(var input in sources.Values)input.Dispose();if(File.Exists(temp))File.Delete(temp);}
+        }
     }
 }
