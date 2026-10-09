@@ -1,0 +1,8 @@
+build/
+*.exe
+*.dll
+*.mix
+*.bak
+*.tmp
+*.pending
+*.log
