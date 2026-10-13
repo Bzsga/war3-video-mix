@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -17,7 +17,7 @@ class StartupManagementTests {
         using(var form=Restore(settings)){
             Check(((TabControl)Field(form,"workflows")).SelectedTab.Text=="管理已有视频包","startup switches to renamed management page");
             Check(((ListView)Field(form,"list")).Items.Count==1&&((string)Field(form,"current")).EndsWith("existing.mix"),"startup opens only valid video package and ignores unrelated plugin");
-            Check(((Button)Field(form,"save")).Text=="保存视频包","management uses highlighted footer save button");
+            Check(((Button)Field(form,"save")).Text=="已是当前版本"&&!((Button)Field(form,"save")).Enabled,"management skips unchanged runtime");
             Check(ManagerPreferences.Load(settings).GameRoot==game,"game directory preferences roundtrip");
             string second=Path.Combine(run,"second.mp4");File.Copy(demo,second);formType.GetMethod("Import",flags).Invoke(form,new object[]{new[]{second}});
             bool saved=false;DateTime deadline=DateTime.UtcNow.AddSeconds(12);var timer=new Timer{Interval=100};

@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 
 [assembly: AssemblyVersion(AppVersion.Number + ".0")]
 [assembly: AssemblyFileVersion(AppVersion.Number + ".0")]
@@ -8,5 +8,5 @@ using System.Reflection;
 [assembly: AssemblyCopyright("作者：半盏丶时光；由 GPT-6 制作")]
 
 public static class AppVersion {
-    public const string Number = "1.1.10";
+    public const string Number = "1.1.14";
 }

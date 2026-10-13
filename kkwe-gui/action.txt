@@ -62,3 +62,104 @@ default = "1.0"
 min = 0.25
 max = 4
 
+[KKWEVideoSetSizeAll]
+title = "视频 - 设置全体玩家的视频窗口大小"
+description = "设置全体玩家的视频窗口宽度为 ${宽度} %，高度为 ${高度} %"
+comment = "尺寸相对于各自的游戏画面，范围1到100，默认100×100。影响当前及后续视频；保留视频比例，调整不重播。所有玩家同步调用。"
+category = TC_War3Video
+script_name = KKWEVideoSetSizeAll
+[[.args]]
+type = real
+default = "100.0"
+min = 1
+max = 100
+[[.args]]
+type = real
+default = "100.0"
+min = 1
+max = 100
+
+[KKWEVideoSetSizeForPlayer]
+title = "视频 - 设置指定玩家的视频窗口大小"
+description = "设置玩家 ${玩家} 的视频窗口宽度为 ${宽度} %，高度为 ${高度} %"
+comment = "只影响指定玩家当前及后续视频，其他玩家保持原设置。尺寸占游戏画面的百分比，范围1到100；调整不重播，窗口超出边缘会自动限制。所有玩家同步调用，无需本地玩家判断。"
+category = TC_War3Video
+script_name = KKWEVideoSetSizeForPlayer
+[[.args]]
+type = player
+default = "Player00"
+[[.args]]
+type = real
+default = "100.0"
+min = 1
+max = 100
+[[.args]]
+type = real
+default = "100.0"
+min = 1
+max = 100
+
+[KKWEVideoSetPositionAll]
+title = "视频 - 设置全体玩家的视频窗口位置"
+description = "设置全体玩家的视频窗口左上角位于横向 ${横向位置} %，纵向 ${纵向位置} %"
+comment = "坐标相对于各自游戏画面的左上角，0为左/上，100为右/下；默认0、0。影响当前及后续视频，超出边缘时自动限制在画面内，调整不重播。所有玩家同步调用。"
+category = TC_War3Video
+script_name = KKWEVideoSetPositionAll
+[[.args]]
+type = real
+default = "0.0"
+min = 0
+max = 100
+[[.args]]
+type = real
+default = "0.0"
+min = 0
+max = 100
+
+[KKWEVideoSetPositionForPlayer]
+title = "视频 - 设置指定玩家的视频窗口位置"
+description = "设置玩家 ${玩家} 的视频窗口左上角位于横向 ${横向位置} %，纵向 ${纵向位置} %"
+comment = "只影响指定玩家当前及后续视频，其他玩家保持原设置。以游戏画面左上角为原点，范围0到100；超出边缘时自动限制，调整不重播。所有玩家同步调用，无需本地玩家判断。"
+category = TC_War3Video
+script_name = KKWEVideoSetPositionForPlayer
+[[.args]]
+type = player
+default = "Player00"
+[[.args]]
+type = real
+default = "0.0"
+min = 0
+max = 100
+[[.args]]
+type = real
+default = "0.0"
+min = 0
+max = 100
+
+[KKWEVideoSetTransparencyAll]
+title = "视频 - 设置全体玩家的视频透明度"
+description = "设置全体玩家的视频透明度为 ${透明度} %"
+comment = "0完全不透明，100完全透明，默认0。影响当前及后续视频画面，不改变音轨音量或播放进度。所有玩家同步调用。"
+category = TC_War3Video
+script_name = KKWEVideoSetTransparencyAll
+[[.args]]
+type = real
+default = "0.0"
+min = 0
+max = 100
+
+[KKWEVideoSetTransparencyForPlayer]
+title = "视频 - 设置指定玩家的视频透明度"
+description = "设置玩家 ${玩家} 的视频透明度为 ${透明度} %"
+comment = "只影响指定玩家当前及后续视频画面，其他玩家保持原设置。0完全不透明，100完全透明；不改变声音和播放进度。所有玩家同步调用，无需本地玩家判断。"
+category = TC_War3Video
+script_name = KKWEVideoSetTransparencyForPlayer
+[[.args]]
+type = player
+default = "Player00"
+[[.args]]
+type = real
+default = "0.0"
+min = 0
+max = 100
+

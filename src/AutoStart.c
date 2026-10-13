@@ -63,11 +63,14 @@ static void Number(wchar_t *out,DWORD n) {
     while(i)out[j++]=tmp[--i];out[j]=0;
 }
 #include "RequestRouting.c"
+#include "ShutdownGuard.c"
 static void Mark(const char *text) {
-    HANDLE file;DWORD written;
-    lstrcpyW(path,game);lstrcatW(path,L"\\War3Video");CreateDirectoryW(path,NULL);
-    lstrcatW(path,L"\\bootstrap.log");
-    file=CreateFileW(path,FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    HANDLE file;DWORD written;wchar_t logPath[8192];
+    // Shutdown logging can run on the game thread while startup is finishing.
+    // Never overwrite Start's shared request/extraction path buffer.
+    lstrcpyW(logPath,game);lstrcatW(logPath,L"\\War3Video");CreateDirectoryW(logPath,NULL);
+    lstrcatW(logPath,L"\\bootstrap.log");
+    file=CreateFileW(logPath,FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
     if(file!=INVALID_HANDLE_VALUE){DWORD size=0;while(text[size])size++;WriteFile(file,text,size,&written,NULL);CloseHandle(file);}
 }
 static DWORD WINAPI Start(LPVOID unused) {
@@ -79,6 +82,7 @@ static DWORD WINAPI Start(LPVOID unused) {
     if(!length)FreeLibraryAndExitThread(retained,0);game[length-1]=0;
     Mark("AUTOLOAD DLL loaded\r\n");
     InstallRequestRouting();
+    InstallShutdownGuard();
     // Provision the writable command file before any map initialization runs.
     Number(pid,GetCurrentProcessId());
     lstrcpyW(path,game);lstrcatW(path,L"\\War3Video\\request-");lstrcatW(path,pid);lstrcatW(path,L".pld");
@@ -86,6 +90,7 @@ static DWORD WINAPI Start(LPVOID unused) {
      if(request!=INVALID_HANDLE_VALUE)CloseHandle(request);else Mark("ERROR request file initialization failed\r\n");}
     Sleep(1500); // Never initialize WPF or start decoding under the loader lock.
     InstallRequestRouting();
+    InstallShutdownGuard();
     if(!ExtractPlayer()){Mark("ERROR invalid package or player extraction failed\r\n");FreeLibraryAndExitThread(retained,0);}
     Number(pid,GetCurrentProcessId());
     lstrcpyW(command,L"\"");lstrcatW(command,exe);lstrcatW(command,L"\" --game-root \"");

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Collections.Generic;
@@ -10,6 +10,7 @@ using System.Diagnostics;
 
 class MixManager : Form {
     List<MixEntry> entries=new List<MixEntry>();string current;bool dirty,busy;
+    string openedId;PackageRuntime runtimeStatus;
     ListView list=new ListView{Dock=DockStyle.Fill,View=View.Details,FullRowSelect=true,MultiSelect=true,HideSelection=false};
     Label info=new Label{Dock=DockStyle.Fill,Padding=new Padding(0,6,0,0)};
     FlowLayoutPanel buttons=new FlowLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(5),WrapContents=false};
@@ -91,7 +92,7 @@ class MixManager : Form {
         catch(Exception e){MessageBox.Show(this,e.Message,"还需要一步");return;}
         bool? keep=ExistingChoice(plan);if(!keep.HasValue)return;var snapshot=entries.ToList();CreationResult result=null;
         busy=true;workflows.Enabled=false;editorBar.Enabled=false;list.Enabled=false;creationControlsEnabled(false);info.Text="正在创建 MIX"+(install?"并安装触发器动作…":"…");
-        try{result=await Task.Run(()=>QuickCreator.Create(plan,snapshot,keep.Value,install,editor,kind,unrecognizedEditor));var package=MixPackage.Open(result.Path);entries=package.Entries;current=package.PathName;dirty=false;mixName.Text=Path.GetFileName(result.Path);}
+        try{result=await Task.Run(()=>QuickCreator.Create(plan,snapshot,keep.Value,install,editor,kind,unrecognizedEditor));var package=MixPackage.Open(result.Path);entries=package.Entries;current=package.PathName;dirty=false;openedId=package.Id;runtimeStatus=PackageRuntime.Current;mixName.Text=Path.GetFileName(result.Path);}
         catch(Exception e){MessageBox.Show(this,e.Message+"\r\n若文件被占用，请退出正在使用它的游戏或工具后重试。","创建失败");}
         finally{busy=false;creationControlsEnabled(true);workflows.Enabled=true;editorBar.Enabled=true;list.Enabled=true;RefreshList();}
         if(result==null)return;
@@ -113,7 +114,7 @@ class MixManager : Form {
     Button AddButton(string text,EventHandler handler){var b=new Button{Text=text,AutoSize=true,Height=28};b.Click+=handler;buttons.Controls.Add(b);return b;}
     void RefreshList(){list.BeginUpdate();try{list.Items.Clear();foreach(var e in entries){var item=new ListViewItem(e.Name);item.SubItems.Add((e.Length/1048576.0).ToString("0.00")+" MB");item.Tag=e;list.Items.Add(item);}}finally{list.EndUpdate();}Text="War3 MIX 视频管理器 v"+AppVersion.Number+(current==null?" — 新包":" — "+Path.GetFileName(current))+(dirty?" *":"");info.Text="内置DLL和播放器 · "+entries.Count+" 段视频 · "+(entries.Sum(e=>e.Length)/1048576.0).ToString("0.00")+" MB · 只分发一个 MIX";if(updateWorkflow!=null)updateWorkflow();}
     bool Discard(){return !dirty || MessageBox.Show(this,"放弃尚未保存的修改？","未保存修改",MessageBoxButtons.YesNo,MessageBoxIcon.Question)==DialogResult.Yes;}
-    void OpenPackage(string path){if(!Discard())return;try{var package=MixPackage.Open(path);entries=package.Entries;current=package.PathName;dirty=false;mixName.Text=Path.GetFileName(current);string folder=Path.GetDirectoryName(current);if(File.Exists(Path.Combine(folder,"war3.exe")))gamePath.Text=folder;workflows.SelectedIndex=1;RefreshList();SavePreferences();}catch(Exception e){MessageBox.Show(this,e.Message,"打开失败");}}
+    void OpenPackage(string path){if(!Discard())return;try{var package=MixPackage.Open(path);var status=PackageUpgrade.Inspect(path,package.Id);entries=package.Entries;current=package.PathName;openedId=package.Id;runtimeStatus=status;dirty=false;mixName.Text=Path.GetFileName(current);string folder=Path.GetDirectoryName(current);if(File.Exists(Path.Combine(folder,"war3.exe")))gamePath.Text=folder;workflows.SelectedIndex=1;RefreshList();SavePreferences();}catch(Exception e){MessageBox.Show(this,e.Message,"打开失败");}}
     void Import(string[] files) {
         foreach(string file in files){string name=Path.GetFileName(file);if(!MixPackage.ValidName(name)){MessageBox.Show(this,"仅支持MP4，文件名不超过120字符："+name);continue;}
             var existing=entries.Find(e=>e.Name.Equals(name,StringComparison.OrdinalIgnoreCase));
@@ -131,6 +132,12 @@ class MixManager : Form {
     }
     async void SavePackage(bool saveAs) {
         if(busy)return;
+        if(!saveAs && current!=null && !dirty){
+            bool changed=false;MixPackage upgraded=null;
+            bool ok=await Work(delegate{changed=PackageUpgrade.Refresh(current,current,openedId);upgraded=MixPackage.Open(current);},"正在升级视频包，保留全部视频，请稍候…");
+            if(ok){entries=upgraded.Entries;openedId=upgraded.Id;runtimeStatus=PackageRuntime.Current;RefreshList();info.Text=changed?"升级完成，已保留全部视频；原包备份为 .bak。下次启动魔兽生效。":"视频包已是当前版本，无需更新。";}
+            return;
+        }
         try{QuickCreator.CheckInputs(entries,false,"",false);}catch(Exception e){MessageBox.Show(this,e.Message,"还需要一步");return;}
         string dest=current;
         if(saveAs||dest==null){using(var dialog=new SaveFileDialog{Filter="War3 视频包|*.mix",FileName=current==null?"War3Video.mix":Path.GetFileName(current)}){if(dialog.ShowDialog(this)!=DialogResult.OK)return;dest=dialog.FileName;}}
@@ -143,11 +150,15 @@ class MixManager : Form {
         }
         bool saved=await Work(delegate {
             var assembly=Assembly.GetExecutingAssembly();
+            using(MixPackage.AcquireWriter(folder)){
+            if(current!=null)PackageUpgrade.CheckWritable(current,openedId);
+            if(File.Exists(target)&&!String.Equals(current,target,StringComparison.OrdinalIgnoreCase))PackageUpgrade.CheckWritable(target);
             if(plan!=null)QuickCreator.Create(plan,snapshot,false,false,"","KKWE");
             else using(var dll=assembly.GetManifestResourceStream("bootstrap"))using(var player=assembly.GetManifestResourceStream("player"))MixPackage.Build(target,dll,player,snapshot);
             savedPackage=MixPackage.Open(target);
+            }
         },"正在封装视频，请稍候…");
-        if(saved){entries=savedPackage.Entries;current=savedPackage.PathName;dirty=false;mixName.Text=Path.GetFileName(current);RefreshList();SavePreferences();info.Text="已保存视频包："+current;}
+        if(saved){entries=savedPackage.Entries;current=savedPackage.PathName;openedId=savedPackage.Id;runtimeStatus=PackageRuntime.Current;dirty=false;mixName.Text=Path.GetFileName(current);RefreshList();SavePreferences();info.Text="已保存视频包："+current;}
     }
     async void ExportSelected() {
         var chosen=list.SelectedItems.Cast<ListViewItem>().Select(i=>(MixEntry)i.Tag).ToList();if(chosen.Count==0){MessageBox.Show(this,"先选择需要导出的视频，可多选。");return;}
@@ -180,10 +191,14 @@ class MixManager : Form {
         var creationFooter=new FlowLayoutPanel{Dock=DockStyle.Fill,FlowDirection=FlowDirection.RightToLeft,WrapContents=false,Margin=new Padding(0),Padding=new Padding(0,0,60,0)};
         var create=new Button{Text="生成视频包",Size=new Size(152,40),Margin=new Padding(3,6,0,0),BackColor=Color.FromArgb(221,237,252),ForeColor=Color.FromArgb(27,75,114),FlatStyle=FlatStyle.Flat,Font=new Font(Font.FontFamily,10,FontStyle.Bold),UseVisualStyleBackColor=false};create.FlatAppearance.BorderColor=Color.FromArgb(145,181,215);create.Click+=delegate{if(workflows.SelectedIndex==0)QuickCreate();else SavePackage(false);};creationFooter.Controls.Add(create);save=create;
         footerHint=new Label{Text="生成到所选魔兽根目录",AutoSize=true,Margin=new Padding(8,18,12,0)};creationFooter.Controls.Add(footerHint);layout.Controls.Add(creationFooter,0,2);creationControls=creationFooter;
-        updateWorkflow=delegate{save.Text=workflows.SelectedIndex==0?"生成视频包":"保存视频包";footerHint.Text=workflows.SelectedIndex==0?"生成到所选魔兽根目录":"保存当前视频包的修改";layout.RowStyles[0].Height=workflows.SelectedIndex==0?184:214;layout.PerformLayout();};workflows.SelectedIndexChanged+=delegate{updateWorkflow();};
+        updateWorkflow=delegate{
+            bool quick=workflows.SelectedIndex==0,upgrade=current!=null&&runtimeStatus==PackageRuntime.UpdateAvailable,newer=current!=null&&runtimeStatus==PackageRuntime.Newer;
+            save.Text=quick?"生成视频包":newer?"请使用新版工具":dirty?(upgrade?"保存并升级":"保存视频包"):upgrade?"升级视频包":current!=null?"已是当前版本":"保存视频包";
+            save.Enabled=quick||(!newer&&(dirty||upgrade));
+            footerHint.Text=quick?"生成到所选魔兽根目录":newer?"包内播放器版本高于此工具":upgrade?"更新播放组件，保留现有视频":dirty?"保存当前视频包的修改":current==null?"请先打开已有视频包":"视频包与此工具的播放组件一致";layout.RowStyles[0].Height=workflows.SelectedIndex==0?184:214;layout.PerformLayout();};workflows.SelectedIndexChanged+=delegate{updateWorkflow();};
         var manageLayout=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=3,Padding=new Padding(8)};
         manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute,24));manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute,42));manageLayout.RowStyles.Add(new RowStyle(SizeType.Percent,100));managePage.Controls.Add(manageLayout);
-        manageLayout.Controls.Add(new Label{Text="打开视频包后，可增删或导出视频；完成后点击右下角“保存视频包”。",Dock=DockStyle.Fill},0,0);manageLayout.Controls.Add(buttons,0,1);
+        manageLayout.Controls.Add(new Label{Text="更新工具后，打开原视频包 → 点击右下角“升级视频包”，无需重新导入视频。",Dock=DockStyle.Fill},0,0);manageLayout.Controls.Add(buttons,0,1);
         var body=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=2,RowCount=1,Margin=new Padding(0,8,0,8)};
         body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,280));layout.Controls.Add(body,0,1);
         var clipsGroup=new GroupBox{Text="包内视频 · 支持拖入 MP4",Dock=DockStyle.Fill,Padding=new Padding(8)};clipsGroup.Controls.Add(list);body.Controls.Add(clipsGroup,0,0);
@@ -228,7 +243,7 @@ class MixManager : Form {
                 if(args[0]=="--uninstall-gui"&&args.Length==3){GuiInstaller.Uninstall(args[1],args[2]);return 0;}
                 if(args[0]=="--pack"&&args.Length>=2){var entries=new List<MixEntry>();foreach(string p in args.Skip(2))entries.Add(new MixEntry(Path.GetFileName(p),Path.GetFullPath(p),0,new FileInfo(p).Length));using(var dll=assembly.GetManifestResourceStream("bootstrap"))using(var player=assembly.GetManifestResourceStream("player"))MixPackage.Build(args[1],dll,player,entries);}
                 else if((args[0]=="--import"||args[0]=="--remove")&&args.Length>=4){var p=MixPackage.Open(args[1]);foreach(string value in args.Skip(3)){string name=Path.GetFileName(value);p.Entries.RemoveAll(e=>e.Name.Equals(name,StringComparison.OrdinalIgnoreCase));if(args[0]=="--import")p.Entries.Add(new MixEntry(name,Path.GetFullPath(value),0,new FileInfo(value).Length));}using(var dll=assembly.GetManifestResourceStream("bootstrap"))using(var player=assembly.GetManifestResourceStream("player"))MixPackage.Build(args[2],dll,player,p.Entries);}
-                else if(args[0]=="--refresh"&&args.Length==3){var p=MixPackage.Open(args[1]);using(var dll=assembly.GetManifestResourceStream("bootstrap"))using(var player=assembly.GetManifestResourceStream("player"))MixPackage.Build(args[2],dll,player,p.Entries);}
+                else if(args[0]=="--refresh"&&args.Length==3){PackageUpgrade.Refresh(args[1],args[2]);}
                 else if(args[0]=="--export"&&args.Length==3){var pack=MixPackage.Open(args[1]);Directory.CreateDirectory(args[2]);foreach(var entry in pack.Entries){string path=Path.Combine(args[2],entry.Name);if(File.Exists(path))throw new IOException("导出目标已存在："+path);MixPackage.Export(entry,path);}}
                 else if(args[0]=="--list"&&args.Length==3){var p=MixPackage.Open(args[1]);File.WriteAllLines(args[2],p.Entries.Select(e=>e.Name+"\t"+e.Length));}
                 else throw new ArgumentException("参数：--pack 输出.mix [视频.mp4…]；--import 输入.mix 输出.mix 视频.mp4…；--remove 输入.mix 输出.mix 文件名…；--export 输入.mix 新目录；--list 输入.mix 清单.txt");

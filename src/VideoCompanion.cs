@@ -36,6 +36,7 @@ class VideoCompanion {
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr h,uint message,IntPtr w,IntPtr l,uint flags,uint timeout,out IntPtr result);
     static string root, request, log, evidence;
     static Window win;
     static MediaElement media;
@@ -46,6 +47,9 @@ class VideoCompanion {
     static DateTime ownerCheckAfter=DateTime.MinValue;
     static CancellationTokenSource extraction;
     static readonly object logGate=new object();
+    static volatile IntPtr monitoredWindow;
+    static volatile bool monitorPlayback,monitorStopped,hostResponsive=true;
+    static Thread healthMonitor;
     static int attachedPid, pinnedPid, clientPid;
     static string active="", lastText="";
     static double offset, duration;
@@ -54,6 +58,8 @@ class VideoCompanion {
     static bool ready, visible, preview, automatic;
     static bool positioned;
     static int positionedX,positionedY,positionedWidth,positionedHeight;
+    static double windowX,windowY,windowWidth=100,windowHeight=100,windowTransparency;
+    static string windowSession="";
     static HashSet<string> completed=new HashSet<string>();
     static Dictionary<string,string> clips=new Dictionary<string,string>();
     static int opens, frameChecks;
@@ -70,6 +76,7 @@ class VideoCompanion {
     static long lastFileLength=-1;
     static DateTime requestReadAfter=DateTime.MinValue;
     static readonly Regex protocol=new Regex(@"WV1\|([A-Za-z0-9_-]{1,64})\|(\d{1,9})\|(PLAY|STOP|SETTINGS)\|([^|\r\n]{1,120})\|([0-9]{1,6}(?:\.[0-9]{1,5})?)\|([0-9]{1,6}(?:\.[0-9]{1,5})?)(?:\|([0-9]{1,3}(?:\.[0-9]{1,5})?)\|([0-9]{1,2}(?:\.[0-9]{1,5})?))?\|END");
+    static readonly Regex windowProtocol=new Regex(@"WVR1\|([A-Za-z0-9_-]{1,64})\|([0-9]{1,3}(?:\.[0-9]{1,5})?)\|([0-9]{1,3}(?:\.[0-9]{1,5})?)\|([0-9]{1,3}(?:\.[0-9]{1,5})?)\|([0-9]{1,3}(?:\.[0-9]{1,5})?)(?:\|([0-9]{1,3}(?:\.[0-9]{1,5})?))?\|END");
     static DateTime gameStarted=DateTime.MinValue;
     static void Log(string s) { lock(logGate){try{Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(log)));File.AppendAllText(log,DateTime.UtcNow.ToString("o")+" "+s+Environment.NewLine);}catch(IOException){}catch(UnauthorizedAccessException){}} }
     static string Arg(string[] args,string k,string fallback) {
@@ -83,6 +90,35 @@ class VideoCompanion {
         // process handle; the attached HWND still stops audio within one tick.
         if(DateTime.UtcNow<ownerCheckAfter && (target!=IntPtr.Zero||pinnedPid<=0))return false;ownerCheckAfter=DateTime.UtcNow.AddSeconds(1);
         try{using(var owner=Process.GetProcessById(ownerPid)){}return false;}catch(ArgumentException){return true;}
+    }
+    static void StartHealthMonitor(Application app) {
+        healthMonitor=new Thread(delegate(){
+            IntPtr previous=IntPtr.Zero;DateTime failedSince=DateTime.MinValue;bool notified=false;
+            while(!monitorStopped){
+                IntPtr h=monitoredWindow;
+                if(!monitorPlayback||h==IntPtr.Zero){previous=IntPtr.Zero;failedSince=DateTime.MinValue;notified=false;hostResponsive=true;Thread.Sleep(100);continue;}
+                if(previous!=h){previous=h;failedSince=DateTime.MinValue;notified=false;}
+                IntPtr response;
+                // Bound the cross-process probe on a background thread. Never
+                // let the media dispatcher synchronously wait on a hung game.
+                bool healthy=SendMessageTimeout(h,0,IntPtr.Zero,IntPtr.Zero,0x0023,80,out response)!=IntPtr.Zero;
+                hostResponsive=healthy;
+                if(healthy){failedSince=DateTime.MinValue;notified=false;}
+                else {
+                    if(failedSince==DateTime.MinValue)failedSince=DateTime.UtcNow;
+                    if(!notified && (DateTime.UtcNow-failedSince).TotalMilliseconds>=1000){
+                        notified=true;
+                        if(!app.Dispatcher.HasShutdownStarted)try{app.Dispatcher.BeginInvoke(new Action(delegate{
+                            if(target==h && active!="" && !hostResponsive){
+                                Log("HOST_UNRESPONSIVE pid="+attachedPid+" hwnd="+h+"; dropping presentation only");
+                                Stop("game-unresponsive");
+                            }
+                        }));}catch(InvalidOperationException){}
+                    }
+                }
+                Thread.Sleep(100);
+            }
+        });healthMonitor.IsBackground=true;healthMonitor.Name="Game response monitor";healthMonitor.Start();
     }
     static void FindGame() {
         if(gameRoot==null || (target!=IntPtr.Zero && IsWindow(target)) || DateTime.UtcNow<scanAfter)return;
@@ -101,11 +137,11 @@ class VideoCompanion {
                 string path=null;try{path=p.MainModule.FileName;}catch(System.ComponentModel.Win32Exception){}
                 if(path!=null && !Path.GetDirectoryName(path).Equals(gameRoot,StringComparison.OrdinalIgnoreCase))return true;
                 if(active!="")Stop("game-changed");
-                completed.Clear();lastText="";lastSequence=-1;lastSession="";lastFileWrite=DateTime.MinValue;lastFileLength=-1;requestReadAfter=DateTime.MinValue;
+                completed.Clear();lastText="";lastSequence=-1;lastSession="";windowSession="";lastFileWrite=DateTime.MinValue;lastFileLength=-1;requestReadAfter=DateTime.MinValue;
                 try{gameStarted=p.StartTime.ToUniversalTime();}catch{gameStarted=DateTime.UtcNow.AddSeconds(-5);}
                 if(attachedGame!=null)attachedGame.Dispose();
                 attachedGame=Process.GetProcessById((int)id);attachedPid=(int)id;attachedProcessReadable=true;
-                target=h;Log("ATTACHED pid="+id+" handle="+target+" path="+(path??"unavailable"));return false;
+                target=h;monitoredWindow=h;hostResponsive=true;Log("ATTACHED pid="+id+" handle="+target+" path="+(path??"unavailable"));return false;
             }}catch(Exception){return true;}
         },IntPtr.Zero);
     }
@@ -134,6 +170,7 @@ class VideoCompanion {
     static void Stop(string reason) {
         if(active!="") { Log("STOP "+active+" "+reason); completed.Add(active); }
         if(extraction!=null){extraction.Cancel();extraction=null;}
+        monitorPlayback=false;
         win.Hide();active="";ready=false;visible=false;positioned=false;
         // Close already stops and releases the graph. Do not stop it twice.
         if(media.Source!=null){media.Volume=0;media.Close();}
@@ -155,6 +192,7 @@ class VideoCompanion {
         if(completed.Contains(key)) return;
         if(active!="") Stop("replaced");
         active=key;automatic=seconds==0;offset=automatic?0:elapsed;duration=seconds;received=DateTime.UtcNow;deadline=received.AddSeconds(automatic?15:Math.Max(0,seconds-elapsed)+2);
+        monitorPlayback=!preview;
         var loading=new CancellationTokenSource();extraction=loading;
         try{
             // First use can copy gigabytes. Keep the dispatcher available for
@@ -204,6 +242,7 @@ class VideoCompanion {
                 Log("SETTINGS volume="+volume.ToString(CultureInfo.InvariantCulture)+" rate="+rate.ToString(CultureInfo.InvariantCulture));
             }
         }
+        ApplyWindowSettings(m.Groups[1].Value,text);
         if(m.Groups[3].Value=="SETTINGS")return;
         string session=m.Groups[1].Value;int sequence=int.Parse(m.Groups[2].Value);
         if(session==lastSession && sequence<=lastSequence && elapsed<1 && !(automatic && sequence==lastSequence) &&
@@ -219,8 +258,25 @@ class VideoCompanion {
             // Settings change only on explicit requests; heartbeats never seek.
         }
     }
+    static void ApplyWindowSettings(string session,string text) {
+        double x=0,y=0,width=100,height=100,transparency=0;
+        if(windowSession==session){x=windowX;y=windowY;width=windowWidth;height=windowHeight;transparency=windowTransparency;}
+        var match=windowProtocol.Match(text);
+        if(match.Success && match.Groups[1].Value==session){
+            double nextX=Num(match.Groups[2].Value),nextY=Num(match.Groups[3].Value),nextWidth=Num(match.Groups[4].Value),nextHeight=Num(match.Groups[5].Value);
+            double nextTransparency=match.Groups[6].Success?Num(match.Groups[6].Value):0;
+            if(nextX<=100 && nextY<=100 && nextWidth>=1 && nextWidth<=100 && nextHeight>=1 && nextHeight<=100 && nextTransparency<=100){x=nextX;y=nextY;width=nextWidth;height=nextHeight;transparency=nextTransparency;}
+        }
+        windowSession=session;
+        if(windowX==x && windowY==y && windowWidth==width && windowHeight==height && windowTransparency==transparency)return;
+        if(windowX!=x || windowY!=y || windowWidth!=width || windowHeight!=height)positioned=false;
+        windowX=x;windowY=y;windowWidth=width;windowHeight=height;windowTransparency=transparency;
+        win.Opacity=1-transparency/100;
+        Log("WINDOW x="+x.ToString(CultureInfo.InvariantCulture)+" y="+y.ToString(CultureInfo.InvariantCulture)+" width="+width.ToString(CultureInfo.InvariantCulture)+" height="+height.ToString(CultureInfo.InvariantCulture)+" transparency="+transparency.ToString(CultureInfo.InvariantCulture));
+    }
     static void Position() {
         if(preview) return;
+        if(!hostResponsive)return; // Avoid Z-order/paint work during shutdown stalls.
         if(target==IntPtr.Zero || !IsWindow(target) || IsIconic(target) || !IsWindowVisible(target)) {
             if(visible) {win.Hide();visible=false;positioned=false;Log("HIDDEN focus/minimized");}return;
         }
@@ -233,11 +289,15 @@ class VideoCompanion {
             // Keep this overlay immediately above its game in the normal Z order,
             // allowing both visible clients to render without covering other apps.
             IntPtr above=GetWindow(target,3);
-            int width=r.R-r.L,height=r.B-r.T;
+            int clientWidth=r.R-r.L,clientHeight=r.B-r.T;
+            if(clientWidth<=0||clientHeight<=0)return;
+            int width=Math.Max(1,Math.Min(clientWidth,(int)Math.Round(clientWidth*windowWidth/100))),height=Math.Max(1,Math.Min(clientHeight,(int)Math.Round(clientHeight*windowHeight/100)));
+            p.X+=Math.Max(0,Math.Min(clientWidth-width,(int)Math.Round(clientWidth*windowX/100)));
+            p.Y+=Math.Max(0,Math.Min(clientHeight-height,(int)Math.Round(clientHeight*windowY/100)));
             if(!positioned||positionedX!=p.X||positionedY!=p.Y||positionedWidth!=width||positionedHeight!=height||above!=overlay){
                 // No activation/owner reorder or synchronous position callback.
                 // ASYNCWINDOWPOS avoids waiting if Windows crosses input queues.
-                if(SetWindowPos(overlay,above==overlay?IntPtr.Zero:above,p.X,p.Y,width,height,(uint)(0x0010|0x0200|0x0400|0x4000|(above==overlay?0x0004:0)))){
+                if(SetWindowPos(overlay,above==overlay?IntPtr.Zero:above,p.X,p.Y,width,height,(uint)(0x0010|0x0200|0x0400|0x2000|0x4000|(above==overlay?0x0004:0)))){
                     positioned=true;positionedX=p.X;positionedY=p.Y;positionedWidth=width;positionedHeight=height;
                 }
             }
@@ -251,7 +311,7 @@ class VideoCompanion {
             try{gone=attachedGame.HasExited;}catch(System.ComponentModel.Win32Exception){attachedProcessReadable=false;}
         }
         if(!gone)return;
-        Stop("attached-game-exit");target=IntPtr.Zero;attachedPid=0;gameStarted=DateTime.MinValue;
+        Stop("attached-game-exit");target=IntPtr.Zero;monitoredWindow=IntPtr.Zero;attachedPid=0;gameStarted=DateTime.MinValue;
         if(attachedGame!=null){attachedGame.Dispose();attachedGame=null;}
         // An editor-owned instance may wait for the next game, but never keep
         // the closed game's audio alive merely because the editor is running.
@@ -344,7 +404,8 @@ class VideoCompanion {
         if(ownerPid>0)Log("OWNER_MONITOR "+(ownerHandle!=IntPtr.Zero?"synchronize-handle":"pid-fallback"));
         if(bundle!=null)Log("BUNDLE "+bundle.PathName+" entries="+bundle.Entries.Count);
         tick.Start();if(evidence!=null)capture.Start();
+        monitoredWindow=target;if(!preview)StartHealthMonitor(app);
         if(preview) Play("preview:1",Arg(args,"--clip","demo"),0,Num(Arg(args,"--duration","8")));
-        app.Run();if(extraction!=null)extraction.Cancel();if(ownerHandle!=IntPtr.Zero)CloseHandle(ownerHandle);if(attachedGame!=null)attachedGame.Dispose();if(instance!=null){instance.ReleaseMutex();instance.Dispose();}Log("EXIT opens="+opens);return 0;
+        app.Run();monitorStopped=true;if(extraction!=null)extraction.Cancel();if(ownerHandle!=IntPtr.Zero)CloseHandle(ownerHandle);if(attachedGame!=null)attachedGame.Dispose();if(instance!=null){instance.ReleaseMutex();instance.Dispose();}Log("EXIT opens="+opens);return 0;
     }
 }
